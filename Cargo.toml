@@ -107,6 +107,7 @@ defmt = [
     "embedded-test/defmt",
 ]
 cordic = []
+fmac = []
 adc3 = []
 adc4 = []
 adc5 = []
@@ -152,6 +153,10 @@ required-features = ["usb"]
 [[example]]
 name = "cordic"
 required-features = ["cordic"]
+
+[[example]]
+name = "fmac"
+required-features = ["fmac"]
 
 [[test]]
 name = "nucleo-g474"
