@@ -1,13 +1,19 @@
 //! True Random Number Generator (TRNG)
 
-use rand::TryRngCore;
+use rand_core::TryRngCore;
 
 use crate::{rcc::Rcc, stm32::RNG};
 use core::{fmt::Formatter, marker::PhantomData};
 
+/// Error type for the RNG peripheral
 pub enum RngError {
+    /// The DRDY bit is not set in the status register.
     NotReady,
+    /// A noise source seed error was detected. [`seed_error_recovery()`]
+    /// should be called to recover from the error.
     SeedError,
+    /// A clock error was detected. fRNGCLOCK is less than fHCLK/32
+    /// The clock error condition is automatically cleared when the clock condition returns to normal.
     ClockError,
 }
 
@@ -24,6 +30,17 @@ impl core::fmt::Debug for RngError {
 impl core::fmt::Display for RngError {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         core::fmt::Debug::fmt(self, f)
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for RngError {
+    fn format(&self, fmt: defmt::Formatter) {
+        match self {
+            RngError::NotReady => defmt::write!(fmt, "RNG Not ready"),
+            RngError::SeedError => defmt::write!(fmt, "RNG Seed error"),
+            RngError::ClockError => defmt::write!(fmt, "RNG Clock error"),
+        }
     }
 }
 
@@ -96,13 +113,36 @@ impl Rng<Running> {
     }
 
     /// Check if the seed error flag is set
+    #[inline(always)]
     pub fn is_seed_error(&self) -> bool {
         unsafe { (*RNG::ptr()).sr().read().seis().bit_is_set() }
     }
 
     /// Check if the clock error flag is set
+    #[inline(always)]
     pub fn is_clock_error(&self) -> bool {
         unsafe { (*RNG::ptr()).sr().read().ceis().bit_is_set() }
+    }
+
+    /// Perform recovery sequence of a seed error from RM0440 26.3.7
+    ///
+    /// The SEIS bit is cleared, and 12 words and read and discarded from the DR register.
+    ///
+    /// If the recovery sequence was successful, the function returns `Ok(())`.
+    /// If the SEIS bit is still set after the recovery sequence, [`RngError::SeedError`] is returned.
+    pub fn seed_error_recovery(&mut self) -> Result<(), RngError> {
+        // Clear SEIS bit
+        unsafe { (*RNG::ptr()).sr().clear_bits(|w| w.seis().clear_bit()) };
+        // Read and discard 12 words from DR register
+        for _ in 0..12 {
+            unsafe { (*RNG::ptr()).dr().read() };
+        }
+        // Confirm SEIS is still clear
+        if unsafe { (*RNG::ptr()).sr().read().seis().bit_is_clear() } {
+            Ok(())
+        } else {
+            Err(RngError::SeedError)
+        }
     }
 
     /// Blocking read of a random u32 from the RNG in polling mode.
@@ -125,6 +165,12 @@ impl Rng<Running> {
     ///
     /// Returns an [`RngError`] if the RNG is not ready or reports an error condition.
     ///
+    /// Once the RNG is ready, 4 consecutive 32 bit reads can be performed without blocking,
+    /// at which point the internal FIFO will be refilled after 216 periods of the AHB clock
+    /// (RM0440 26.7.3)
+    ///
+    /// While the RNG is filling the FIFO, the function will return [`RngError::NotReady`].
+    ///
     /// For blocking reads use [`read_blocking()`]
     pub fn read_non_blocking(&self) -> Result<u32, RngError> {
         // Read the SR register to check if there is an error condition,
@@ -141,8 +187,13 @@ impl Rng<Running> {
         }
 
         if status.drdy().bit_is_set() {
-            // Data is ready. Read the DR register and return the value.
-            Ok(unsafe { (*RNG::ptr()).dr().read().bits() })
+            // The data ready bit is set. Read the DR register and check if it is zero.
+            // A zero read indicates a seed error between reading SR and DR registers
+            // see RM0440 26.7.3 RNDATA description.
+            match unsafe { (*RNG::ptr()).dr().read().bits() } {
+                0 => Err(RngError::SeedError),
+                data => Ok(data),
+            }
         } else {
             Err(RngError::NotReady)
         }
